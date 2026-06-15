@@ -2,6 +2,7 @@ local ButtonDialog = require("ui/widget/buttondialog")
 local UIManager = require("ui/uimanager")
 local DownloadedFanfics = require("downloaded_fanfics")
 local InfoMessage = require("ui/widget/infomessage")
+local Config = require("fanfic_config")
 local _ = require("gettext")
 local util = require("util")
 local FFIUtil = require("ffi/util")
@@ -9,6 +10,8 @@ local T = FFIUtil.template
 
 local KeyValuePage = require("ui/widget/keyvaluepage")
 local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextViewer = require("ui/widget/textviewer")
+local InputContainer = require("ui/widget/container/inputcontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local LineWidget = require("ui/widget/linewidget")
@@ -17,6 +20,7 @@ local Font = require("ui/font")
 local Device = require("device")
 local Screen = Device.screen
 local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
 local Blitbuffer = require("ffi/blitbuffer")
 
 local FanficBrowser = {
@@ -25,6 +29,7 @@ local FanficBrowser = {
     updateFanficCallback = nil,
     downloadFanficCallback = nil,
     showAuthorInfoCallback = nil,
+    searchByTagCallback = nil,
 }
 
 -- Split a comma-separated string into a table, or return the table as-is.
@@ -147,6 +152,58 @@ function FanficCardPage:_populateItems()
     end)
 end
 
+-- Wrap a widget in an InputContainer that fires callback on tap.
+-- The widget must already have a size so the gesture range can be set.
+function FanficCardPage:makeTappable(widget, callback)
+    local size = widget:getSize()
+    local container = InputContainer:new{
+        dimen = Geom:new{ w = size.w, h = size.h },
+        widget,
+    }
+    if Device:isTouchDevice() then
+        container.ges_events = {
+            Tap = {
+                GestureRange:new{
+                    ges = "tap",
+                    range = container.dimen,
+                },
+            },
+        }
+        container.onTap = function()
+            callback()
+            return true
+        end
+    end
+    return container
+end
+
+-- Show a disambiguation dialog listing multiple values. Tapping a value
+-- triggers the given callback with that value. Used for authors, fandoms,
+-- relationships, and characters.
+function FanficCardPage:showPickerDialog(title, values, callback)
+    local buttons = {}
+    for _, value in ipairs(values) do
+        table.insert(buttons, {{
+            text = value,
+            callback = function()
+                UIManager:close(self._picker_dialog)
+                callback(value)
+            end,
+        }})
+    end
+    table.insert(buttons, {{
+        text = _("Close"),
+        callback = function()
+            UIManager:close(self._picker_dialog)
+        end,
+    }})
+    self._picker_dialog = ButtonDialog:new{
+        title = title,
+        buttons = buttons,
+    }
+    UIManager:show(self._picker_dialog)
+end
+
 --- Build the full card widget for a single fanfic.
 -- Returns a VerticalGroup that fits within the content area established
 -- by the parent KeyValuePage layout.
@@ -210,6 +267,31 @@ function FanficCardPage:buildCard(fanfic)
         return text:sub(1, lo) .. "..."
     end
 
+    -- Build a tappable single-line text element. If the full text was
+    -- truncated, tapping expands it in a TextViewer popup.
+    local function addTappableField(display_text, full_text, face, height, tap_callback)
+        local widget = TextBoxWidget:new{
+            text = display_text,
+            face = face,
+            width = content_width,
+            height = height,
+        }
+        if tap_callback then
+            addElement(self:makeTappable(widget, tap_callback))
+        elseif display_text ~= full_text then
+            -- Text was truncated, tap to expand in a popup
+            addElement(self:makeTappable(widget, function()
+                UIManager:show(TextViewer:new{
+                    title = _("Full text"),
+                    text = full_text,
+                    width = content_width,
+                })
+            end))
+        else
+            addElement(widget)
+        end
+    end
+
     -- == TITLE ==
     local title_text
     if fanfic.is_deleted then
@@ -230,26 +312,42 @@ function FanficCardPage:buildCard(fanfic)
         bold = true,
     }:getSize().h
 
-    title_text = truncateToFit(title_text, title_face, title_line_height)
+    local title_display = truncateToFit(title_text, title_face, title_line_height)
 
-    addElement(TextBoxWidget:new{
-        text = title_text,
+    -- Title tap: download dialog (new fic) or update/open (already downloaded).
+    local title_widget = TextBoxWidget:new{
+        text = title_display,
         face = title_face,
         width = content_width,
         height = title_line_height,
         bold = true,
-    })
+    }
+    if not fanfic.is_deleted then
+        addElement(self:makeTappable(title_widget, function()
+            self:onTitleTap(fanfic)
+        end))
+    else
+        addElement(title_widget)
+    end
 
     -- == AUTHOR LINE ==
     local author_text = "by " .. (fanfic.author or "Anonymous")
     if fanfic.gifted_to then
         author_text = author_text .. " (Gifted to: " .. fanfic.gifted_to .. ")"
     end
-    addElement(TextBoxWidget:new{
+    local author_widget = TextBoxWidget:new{
         text = author_text,
         face = stats_face,
         width = content_width,
-    })
+    }
+    -- Tap to show author profile. If multiple authors, shows a picker.
+    if fanfic.author then
+        addElement(self:makeTappable(author_widget, function()
+            self:onAuthorTap(fanfic)
+        end))
+    else
+        addElement(author_widget)
+    end
 
     addSpacing(Size.padding.small)
     addElement(LineWidget:new{
@@ -322,54 +420,52 @@ function FanficCardPage:buildCard(fanfic)
             width = content_width,
         }:getSize().h
 
-        -- Fandom
-        local fandom_text = "Fandom: " .. (#fanfic.fandoms > 0 and table.concat(fanfic.fandoms, ", ") or "None listed")
-        addElement(TextBoxWidget:new{
-            text = truncateToFit(fandom_text, stats_face, tag_line_height),
-            face = stats_face,
-            width = content_width,
-            height = tag_line_height,
-        })
-
-        -- Warnings
-        local warnings_text = "Warnings: " .. (#fanfic.warnings > 0 and table.concat(fanfic.warnings, ", ") or "None")
-        addElement(TextBoxWidget:new{
-            text = truncateToFit(warnings_text, stats_face, tag_line_height),
-            face = stats_face,
-            width = content_width,
-            height = tag_line_height,
-        })
-
-        -- Relationships - single line, ellipsis if too long
-        local rel_text = "Relationships: "
-        if fanfic.category and fanfic.category ~= "" then
-            rel_text = rel_text .. "(" .. fanfic.category .. ") "
+        -- Fandom - tap to search by fandom tag
+        local fandom_full = "Fandom: " .. (#fanfic.fandoms > 0 and table.concat(fanfic.fandoms, ", ") or "None listed")
+        local fandom_display = truncateToFit(fandom_full, stats_face, tag_line_height)
+        local fandom_callback = nil
+        if #fanfic.fandoms > 0 and self.searchByTagCallback then
+            fandom_callback = function()
+                self:onTagFieldTap(fanfic.fandoms, "Fandom", fandom_full)
+            end
         end
-        rel_text = rel_text .. (#fanfic.relationships > 0 and table.concat(fanfic.relationships, ", ") or "None listed")
-        addElement(TextBoxWidget:new{
-            text = truncateToFit(rel_text, stats_face, tag_line_height),
-            face = stats_face,
-            width = content_width,
-            height = tag_line_height,
-        })
+        addTappableField(fandom_display, fandom_full, stats_face, tag_line_height, fandom_callback)
 
-        -- Characters - single line, ellipsis if too long
-        local char_text = "Characters: " .. (#fanfic.characters > 0 and table.concat(fanfic.characters, ", ") or "None listed")
-        addElement(TextBoxWidget:new{
-            text = truncateToFit(char_text, stats_face, tag_line_height),
-            face = stats_face,
-            width = content_width,
-            height = tag_line_height,
-        })
+        -- Warnings - display only, tap to expand if truncated
+        local warnings_full = "Warnings: " .. (#fanfic.warnings > 0 and table.concat(fanfic.warnings, ", ") or "None")
+        local warnings_display = truncateToFit(warnings_full, stats_face, tag_line_height)
+        addTappableField(warnings_display, warnings_full, stats_face, tag_line_height)
 
-        -- Tags - single line, ellipsis if too long
-        local tags_text = "Tags: " .. (#fanfic.tags > 0 and table.concat(fanfic.tags, ", ") or "None")
-        addElement(TextBoxWidget:new{
-            text = truncateToFit(tags_text, stats_face, tag_line_height),
-            face = stats_face,
-            width = content_width,
-            height = tag_line_height,
-        })
+        -- Relationships - tap to search by relationship tag
+        local rel_full = "Relationships: "
+        if fanfic.category and fanfic.category ~= "" then
+            rel_full = rel_full .. "(" .. fanfic.category .. ") "
+        end
+        rel_full = rel_full .. (#fanfic.relationships > 0 and table.concat(fanfic.relationships, ", ") or "None listed")
+        local rel_display = truncateToFit(rel_full, stats_face, tag_line_height)
+        local rel_callback = nil
+        if #fanfic.relationships > 0 and self.searchByTagCallback then
+            rel_callback = function()
+                self:onTagFieldTap(fanfic.relationships, "Relationship", rel_full)
+            end
+        end
+        addTappableField(rel_display, rel_full, stats_face, tag_line_height, rel_callback)
+
+        -- Characters - tap to search by character tag
+        local char_full = "Characters: " .. (#fanfic.characters > 0 and table.concat(fanfic.characters, ", ") or "None listed")
+        local char_display = truncateToFit(char_full, stats_face, tag_line_height)
+        local char_callback = nil
+        if #fanfic.characters > 0 and self.searchByTagCallback then
+            char_callback = function()
+                self:onTagFieldTap(fanfic.characters, "Character", char_full)
+            end
+        end
+        addTappableField(char_display, char_full, stats_face, tag_line_height, char_callback)
+
+        -- Tags - tap to expand if truncated, no search
+        local tags_full = "Tags: " .. (#fanfic.tags > 0 and table.concat(fanfic.tags, ", ") or "None")
+        local tags_display = truncateToFit(tags_full, stats_face, tag_line_height)
+        addTappableField(tags_display, tags_full, stats_face, tag_line_height)
 
         -- == SEPARATOR before summary ==
         addSpacing(Size.padding.small)
@@ -388,15 +484,10 @@ function FanficCardPage:buildCard(fanfic)
     end
 
     local raw_summary = fanfic.summary or "No summary available"
+    local summary_display = truncateToFit(raw_summary, body_face, available_for_summary)
 
-    raw_summary = truncateToFit(raw_summary, body_face, available_for_summary)
-
-    addElement(TextBoxWidget:new{
-        text = raw_summary,
-        face = body_face,
-        width = content_width,
-        height = available_for_summary,
-    })
+    -- Tap to expand in a popup if the summary was truncated
+    addTappableField(summary_display, raw_summary, body_face, available_for_summary)
 
     local card_content = VerticalGroup:new{ align = "left" }
     for _, elem in ipairs(elements) do
@@ -404,6 +495,127 @@ function FanficCardPage:buildCard(fanfic)
     end
 
     return card_content
+end
+
+-- Title tap: show download dialog for new fics, or update/open for downloaded ones.
+function FanficCardPage:onTitleTap(fanfic)
+    local downloaded = DownloadedFanfics.checkIfStored(fanfic.id)
+    if downloaded then
+        local dialog
+        dialog = ButtonDialog:new{
+            title = _("Fanfic is already downloaded, what would you like to do?"),
+            buttons = {
+                {
+                    {
+                        text = _("Update"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            UIManager:scheduleIn(1, function()
+                                self.updateFanficCallback(downloaded)
+                            end)
+                            UIManager:show(InfoMessage:new{
+                                text = _("Downloading work may take some time."),
+                                timeout = 1,
+                            })
+                        end,
+                    },
+                    {
+                        text = _("Open"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            self.Fanfic:onOpenFanficReader(downloaded.path, downloaded)
+                        end,
+                    },
+                    {
+                        text = _("Cancel"),
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+    else
+        if Config:readSetting("show_adult_warning")
+            and (fanfic.rating == "Explicit" or fanfic.rating == "Mature" or fanfic.rating == "Not Rated")
+        then
+            FanficBrowser:showAdultWarningDialog(fanfic)
+        else
+            FanficBrowser:showDownloadDialog(fanfic)
+        end
+    end
+end
+
+-- Author tap: show author profile. If multiple authors or a giftee exists,
+-- show a picker so the user can choose which profile to view.
+function FanficCardPage:onAuthorTap(fanfic)
+    local people = {}
+    if fanfic.author then
+        for author in string.gmatch(fanfic.author, "([^,]+)") do
+            table.insert(people, util.trim(author))
+        end
+    end
+    if fanfic.gifted_to then
+        for giftee in string.gmatch(fanfic.gifted_to, "([^,]+)") do
+            table.insert(people, util.trim(giftee) .. " (Giftee)")
+        end
+    end
+
+    if #people == 1 then
+        self.showAuthorInfoCallback(people[1])
+    elseif #people > 1 then
+        self:showPickerDialog(
+            T("Work %1: %2", string.find(fanfic.author, ",") and "authors" or "author", fanfic.author),
+            people,
+            function(selected)
+                -- Strip " (Giftee)" suffix before looking up
+                local name = selected:gsub(" %(Giftee%)$", "")
+                self.showAuthorInfoCallback(name)
+            end
+        )
+    end
+end
+
+-- Tag field tap: if one value, search directly. If multiple, show a picker.
+-- The picker also offers an "expand" option to view the full text.
+function FanficCardPage:onTagFieldTap(values, category, full_text)
+    if #values == 1 then
+        self.searchByTagCallback(values[1])
+    elseif #values > 1 then
+        -- Build buttons: each value searches, plus an expand option
+        local buttons = {}
+        for _, value in ipairs(values) do
+            table.insert(buttons, {{
+                text = value,
+                callback = function()
+                    UIManager:close(self._picker_dialog)
+                    self.searchByTagCallback(value)
+                end,
+            }})
+        end
+        table.insert(buttons, {{
+            text = _("View all"),
+            callback = function()
+                UIManager:close(self._picker_dialog)
+                UIManager:show(TextViewer:new{
+                    title = category,
+                    text = full_text,
+                })
+            end,
+        }})
+        table.insert(buttons, {{
+            text = _("Close"),
+            callback = function()
+                UIManager:close(self._picker_dialog)
+            end,
+        }})
+        self._picker_dialog = ButtonDialog:new{
+            title = T("Search by %1", category),
+            buttons = buttons,
+        }
+        UIManager:show(self._picker_dialog)
+    end
 end
 
 function FanficBrowser:showDownloadDialog(fanfic)
@@ -462,11 +674,15 @@ function FanficBrowser:showAdultWarningDialog(fanfic)
     UIManager:show(warningDialog)
 end
 
-function FanficBrowser:show(ui, ficResults, fetchNextPage, updateFanficCallback, downloadFanficCallback, showAuthorInfoCallback, Fanfic)
+--- Main entry point - called by main.lua and fanfic_menu.lua.
+-- searchByTagCallback is optional; when provided, fandom/relationship/character
+-- fields become tappable to trigger a tag search.
+function FanficBrowser:show(ui, ficResults, fetchNextPage, updateFanficCallback, downloadFanficCallback, showAuthorInfoCallback, Fanfic, searchByTagCallback)
     self.ui = ui
     self.updateFanficCallback = updateFanficCallback
     self.downloadFanficCallback = downloadFanficCallback
     self.showAuthorInfoCallback = showAuthorInfoCallback
+    self.searchByTagCallback = searchByTagCallback
     self.Fanfic = Fanfic
 
     -- Remove the total field so it does not get treated as a fanfic entry.
@@ -476,6 +692,12 @@ function FanficBrowser:show(ui, ficResults, fetchNextPage, updateFanficCallback,
         title = _("AO3 Search Results"),
         fanfics = ficResults,
         fetchNextPage = fetchNextPage,
+        -- Pass callbacks through so the card page can trigger actions
+        updateFanficCallback = updateFanficCallback,
+        downloadFanficCallback = downloadFanficCallback,
+        showAuthorInfoCallback = showAuthorInfoCallback,
+        searchByTagCallback = searchByTagCallback,
+        Fanfic = Fanfic,
         close_callback = function()
             Fanfic.menu_stack[self.browse_window] = nil
             self.browse_window = nil
