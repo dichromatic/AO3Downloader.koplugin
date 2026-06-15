@@ -1,14 +1,23 @@
 local ButtonDialog = require("ui/widget/buttondialog")
-local KeyValuePage = require("ui/widget/keyvaluepage")
 local UIManager = require("ui/uimanager")
 local DownloadedFanfics = require("downloaded_fanfics")
 local InfoMessage = require("ui/widget/infomessage")
-local FanficReader = require("fanfic_reader")
-local Config = require("fanfic_config")
 local _ = require("gettext")
 local util = require("util")
 local FFIUtil = require("ffi/util")
 local T = FFIUtil.template
+
+local KeyValuePage = require("ui/widget/keyvaluepage")
+local TextBoxWidget = require("ui/widget/textboxwidget")
+local VerticalGroup = require("ui/widget/verticalgroup")
+local VerticalSpan = require("ui/widget/verticalspan")
+local LineWidget = require("ui/widget/linewidget")
+local Size = require("ui/size")
+local Font = require("ui/font")
+local Device = require("device")
+local Screen = Device.screen
+local Geom = require("ui/geometry")
+local Blitbuffer = require("ffi/blitbuffer")
 
 local FanficBrowser = {
     ui = nil,
@@ -18,215 +27,383 @@ local FanficBrowser = {
     showAuthorInfoCallback = nil,
 }
 
+-- Split a comma-separated string into a table, or return the table as-is.
+-- Needed because AO3 API sometimes returns strings instead of arrays.
+local function normalizeField(field)
+    if type(field) == "string" then
+        local result = {}
+        for item in string.gmatch(field, "([^,]+)") do
+            table.insert(result, util.trim(item))
+        end
+        return result
+    elseif type(field) == "table" then
+        return field
+    else
+        return {}
+    end
+end
 
-function FanficBrowser:generateTable(kv_pairs, ficResults, updateFanficCallback, downloadFanficCallback)
-    -- Helper function to check if a fanfic is already downloaded
-    local function isDownloaded(fanficId)
-        return DownloadedFanfics.checkIfStored(fanficId)
+-- Format a number with comma separators for readability (e.g. 45231 -> "45,231").
+-- Strips any existing commas first because AO3 sometimes returns pre-formatted strings.
+local function formatNumber(n)
+    if not n then return "0" end
+    local s = tostring(n):gsub(",", "")
+    local result = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    if result:sub(1, 1) == "," then
+        result = result:sub(2)
+    end
+    return result
+end
+
+-- Card page widget extending KeyValuePage. Inherits the nav bar, title bar,
+-- gesture handling, keyboard support, and screen refresh logic. Only the
+-- content area rendering is customized to show one fanfic card per page.
+local FanficCardPage = KeyValuePage:extend{}
+
+function FanficCardPage:init()
+    -- Build a dummy kv_pairs array so the parent's pagination math works.
+    -- Each entry maps to one fanfic; we override _populateItems to render
+    -- card content instead of KeyValueItem rows.
+    self.kv_pairs = {}
+    for i = 1, #self.fanfics do
+        table.insert(self.kv_pairs, {tostring(i), ""})
     end
 
-    -- Helper function to normalize a field to always be a table
-    local function normalizeField(field)
-        if type(field) == "string" then
-            -- Split the string by commas and trim whitespace
-            local result = {}
-            for item in string.gmatch(field, "([^,]+)") do
-                table.insert(result, util.trim(item))
+    -- Prevent the parent's _populateItems call during init from doing real
+    -- work, since items_per_page and pages haven't been corrected yet.
+    self._card_init_done = false
+    KeyValuePage.init(self)
+    self._card_init_done = true
+
+    -- One fanfic per page instead of the parent's multi-row layout.
+    self.items_per_page = 1
+    self.pages = #self.fanfics
+
+    -- The parent init computes available_height as a local. Recompute it
+    -- here so buildCard knows how much vertical space the content area has.
+    self.content_height = self.dimen.h
+        - self.title_bar:getHeight()
+        - Size.span.vertical_large
+        - self.page_info:getSize().h
+        - 2 * Size.line.thick
+
+    self:_populateItems()
+end
+
+function FanficCardPage:_populateItems()
+    if not self._card_init_done then return end
+
+    -- Fetch the next AO3 page when arriving at the last loaded fanfic.
+    if self.show_page == self.pages and self.fetchNextPage then
+        local new_fics = self.fetchNextPage()
+        if new_fics and #new_fics > 0 then
+            for _, fic in ipairs(new_fics) do
+                table.insert(self.fanfics, fic)
+                table.insert(self.kv_pairs, {tostring(#self.fanfics), ""})
             end
-            return result
-        elseif type(field) == "table" then
-            return field -- Already a table
+            self.pages = #self.fanfics
+        end
+    end
+
+    self.layout = {}
+    self.page_info:resetLayout()
+    self.return_button:resetLayout()
+    self.main_content:clear()
+
+    local fanfic = self.fanfics[self.show_page]
+    if fanfic then
+        local card = self:buildCard(fanfic)
+        table.insert(self.main_content, card)
+    end
+
+    -- Nav bar update - identical to KeyValuePage._populateItems
+    if self.pages >= 1 then
+        self.page_info_text:setText(T(_("Page %1 of %2"), self.show_page, self.pages))
+        if self.pages > 1 then
+            self.page_info_text:enable()
         else
-            return {} -- Default to an empty table
+            self.page_info_text:disableWithoutDimming()
         end
+        self.page_info_left_chev:show()
+        self.page_info_right_chev:show()
+        self.page_info_first_chev:show()
+        self.page_info_last_chev:show()
+
+        self.page_info_left_chev:enableDisable(self.show_page > 1)
+        self.page_info_right_chev:enableDisable(self.show_page < self.pages)
+        self.page_info_first_chev:enableDisable(self.show_page > 1)
+        self.page_info_last_chev:enableDisable(self.show_page < self.pages)
+    else
+        self.page_info_text:setText(_("No items"))
+        self.page_info_text:disableWithoutDimming()
+        self.page_info_left_chev:hide()
+        self.page_info_right_chev:hide()
+        self.page_info_first_chev:hide()
+        self.page_info_last_chev:hide()
     end
 
-    -- Populate the initial list of fanfics
-    for __, v in pairs(ficResults) do
-        if __ == "total" then
-            goto continue
+    UIManager:setDirty(self, function()
+        return "ui", self.dimen
+    end)
+end
+
+--- Build the full card widget for a single fanfic.
+-- Returns a VerticalGroup that fits within the content area established
+-- by the parent KeyValuePage layout.
+function FanficCardPage:buildCard(fanfic)
+    local content_width = self.item_width
+
+    local title_face = Font:getFace("tfont", 24)
+    local body_face = Font:getFace("cfont", 22)
+    local stats_face = Font:getFace("ffont", 18)
+
+    -- Normalize fields that may arrive as comma-separated strings
+    fanfic.fandoms = normalizeField(fanfic.fandoms)
+    fanfic.warnings = normalizeField(fanfic.warnings)
+    fanfic.relationships = normalizeField(fanfic.relationships)
+    fanfic.characters = normalizeField(fanfic.characters)
+    fanfic.tags = normalizeField(fanfic.tags)
+
+    local used_height = 0
+    local elements = {}
+
+    local function addElement(widget)
+        table.insert(elements, widget)
+        used_height = used_height + widget:getSize().h
+    end
+
+    local function addSpacing(height)
+        local span = VerticalSpan:new{ width = height or Size.padding.default }
+        addElement(span)
+    end
+
+    -- Truncate text with ellipsis if it would overflow max_height when
+    -- rendered. Uses actual TextBoxWidget measurement so DPI scaling
+    -- cannot cause silent clipping. Binary searches for the longest
+    -- substring that fits so the ellipsis appears near the right edge.
+    local function truncateToFit(text, face, max_height)
+        local probe = TextBoxWidget:new{ text = text, face = face, width = content_width }
+        local actual_height = probe:getSize().h
+        probe:free()
+        if actual_height <= max_height then
+            return text
         end
-
-        if v.is_deleted then
-            table.insert(kv_pairs, { "DELETED WORK", "", separator = true })
-            for i = 1, 12 do
-                table.insert(kv_pairs, { "", "" })
+        -- Start from a proportional estimate, then binary search upward
+        -- to find the longest substring that still fits with "..." appended.
+        local lo = math.max(1, math.floor(#text * (max_height / actual_height)))
+        local hi = #text
+        while lo < hi do
+            local mid = math.ceil((lo + hi) / 2)
+            probe = TextBoxWidget:new{
+                text = text:sub(1, mid) .. "...",
+                face = face,
+                width = content_width,
+            }
+            local fits = probe:getSize().h <= max_height
+            probe:free()
+            if fits then
+                lo = mid
+            else
+                hi = mid - 1
             end
-            table.insert(kv_pairs, { "", "", separator = true })
-            goto continue
         end
-        -- Normalize relationships, characters, and tags
-        v.relationships = normalizeField(v.relationships)
-        v.characters = normalizeField(v.characters)
-        v.tags = normalizeField(v.tags)
+        return text:sub(1, lo) .. "..."
+    end
 
-        -- Check if the fanfic is already downloaded
-        local downloadedFanfic = isDownloaded(v.id)
-        local title = v.title
-
-        -- Add a lock symbol if the work is restricted
-        if v.is_restricted then
-            title = "🔒 " .. title
+    -- == TITLE ==
+    local title_text
+    if fanfic.is_deleted then
+        title_text = "DELETED WORK"
+    else
+        title_text = fanfic.title or "Untitled"
+        if fanfic.is_restricted then
+            title_text = "[Restricted] " .. title_text
         end
-
-        if downloadedFanfic then
-            title = "✓ " .. title -- Append the download symbol to the title
+        if DownloadedFanfics.checkIfStored(fanfic.id) then
+            title_text = "[dl] " .. title_text
         end
+    end
+    local title_line_height = TextBoxWidget:new{
+        text = "X",
+        face = title_face,
+        width = content_width,
+        bold = true,
+    }:getSize().h
 
-        -- Add the fanfic to the list with appropriate callback
+    title_text = truncateToFit(title_text, title_face, title_line_height)
 
-        local title_item
-        title_item = {
-            title,
-            "",
-            callback = function()
-                local downloadedFanfic = isDownloaded(v.id)
-                if downloadedFanfic then
-                    -- Show options to update or view the fanfic
-                    local dialog
-                    dialog = ButtonDialog:new({
-                        title = _("Fanfic is already downloaded, what would you like to do?"),
-                        buttons = {
-                            {
-                                {
-                                    text = _("Update"),
-                                    callback = function()
-                                        UIManager:scheduleIn(1, function()
-                                            updateFanficCallback(downloadedFanfic)
-                                        end)
-                                        UIManager:close(dialog)
-                                        UIManager:show(InfoMessage:new({
-                                            text = _("Downloading work may take some time…"),
-                                            timeout = 1,
-                                        }))
-                                    end,
-                                },
-                                {
-                                    text = _("Open"),
-                                    callback = function()
-                                        UIManager:close(dialog)
-                                        self.Fanfic:onOpenFanficReader(downloadedFanfic.path, downloadedFanfic)
-                                    end,
-                                },
-                                {
-                                    text = _("Cancel"),
-                                    callback = function()
-                                        UIManager:close(dialog)
-                                    end,
-                                },
-                            },
-                        },
-                    })
-                    UIManager:show(dialog)
-                else
-                    if
-                        Config:readSetting("show_adult_warning")
-                        and (v.rating == "Explicit" or v.rating == "Mature" or v.rating == "Not Rated")
-                    then
-                        self:showAdultWarningDialog(v)
-                    else
-                        self:showDownloadDialog(v)
-                    end
-                end
-            end,
-        }
+    addElement(TextBoxWidget:new{
+        text = title_text,
+        face = title_face,
+        width = content_width,
+        height = title_line_height,
+        bold = true,
+    })
 
-        table.insert(kv_pairs, title_item)
-        -- Add additional details about the fanfic
-        table.insert(kv_pairs, { "     " .. "Author:", (v.author or "Anonymous") .. (v.gifted_to and (" (Gifted to: " .. v.gifted_to .. ")") or "") ,
-        callback = function()
+    -- == AUTHOR LINE ==
+    local author_text = "by " .. (fanfic.author or "Anonymous")
+    if fanfic.gifted_to then
+        author_text = author_text .. " (Gifted to: " .. fanfic.gifted_to .. ")"
+    end
+    addElement(TextBoxWidget:new{
+        text = author_text,
+        face = stats_face,
+        width = content_width,
+    })
 
-            local buttons = {}
+    addSpacing(Size.padding.small)
+    addElement(LineWidget:new{
+        dimen = Geom:new{ w = content_width, h = Size.line.medium },
+        background = Blitbuffer.COLOR_DARK_GRAY,
+    })
+    addSpacing(Size.padding.small)
 
-            local dialog
+    if not fanfic.is_deleted then
+        -- == STATS ==
+        local stats_parts = {}
+        if fanfic.rating then
+            local short_ratings = {
+                ["Not Rated"] = "N/A",
+                ["General Audiences"] = "G",
+                ["Teen And Up Audiences"] = "T",
+                ["Mature"] = "M",
+                ["Explicit"] = "E",
+            }
+            table.insert(stats_parts, "Rating: " .. (short_ratings[fanfic.rating] or fanfic.rating))
+        end
+        if fanfic.words then
+            table.insert(stats_parts, "Words: " .. formatNumber(fanfic.words))
+        end
+        if fanfic.language then
+            table.insert(stats_parts, fanfic.language)
+        end
+        if fanfic.date then
+            table.insert(stats_parts, fanfic.date)
+        end
+        addElement(TextBoxWidget:new{
+            text = table.concat(stats_parts, " | "),
+            face = stats_face,
+            width = content_width,
+        })
 
-            if v.author then
-                for author in string.gmatch(v.author, '([^,]+)') do
-                    table.insert(buttons, {{
-                        text = util.trim(author),
-                        callback = function()
-                                UIManager:close(dialog)
-                                self.showAuthorInfoCallback(util.trim(author))
-                        end,
-                    }})
-                end
-            end
+        local chapter_line = (fanfic.iswip or "Unknown") .. ", " .. (fanfic.chapters or "?/?") .. " chapters"
+        addElement(TextBoxWidget:new{
+            text = chapter_line,
+            face = stats_face,
+            width = content_width,
+        })
 
-            if v.gifted_to then
-                for giftee in string.gmatch(v.gifted_to, '([^,]+)') do
-                    table.insert(buttons, {{
-                        text = util.trim(giftee) .. " (Giftee)",
-                        callback = function()
-                                UIManager:close(dialog)
-                                self.showAuthorInfoCallback(util.trim(giftee))
-                        end,
-                    }})
-                end
-            end
-
-            -- If no buttons were created, just return
-            if #buttons == 0 then
-                return
-            end
-
-            table.insert(buttons,{{
-                text = _("Close"),
-                callback = function()
-                    UIManager:close(dialog)
-                end,
-            }})
-
-            dialog = ButtonDialog:new({
-
-                title = T("Work %1: %2", string.find(v.author, ",") and "authors" or "author", v.author),
-                buttons = buttons,
+        local engagement_parts = {}
+        if fanfic.hits then table.insert(engagement_parts, "Hits: " .. formatNumber(fanfic.hits)) end
+        if fanfic.kudos then table.insert(engagement_parts, "Kudos: " .. formatNumber(fanfic.kudos)) end
+        if fanfic.bookmarks then table.insert(engagement_parts, "Bookmarks: " .. formatNumber(fanfic.bookmarks)) end
+        if fanfic.comments then table.insert(engagement_parts, "Comments: " .. formatNumber(fanfic.comments)) end
+        if #engagement_parts > 0 then
+            addElement(TextBoxWidget:new{
+                text = table.concat(engagement_parts, " | "),
+                face = stats_face,
+                width = content_width,
             })
-            UIManager:show(dialog)
-        end,
-        })
-        table.insert(kv_pairs, { "     " .. "Rating:", v.rating })
-        table.insert(
-            kv_pairs,
-            { "     " .. "Fandom:", #v.fandoms > 0 and table.concat(v.fandoms, ", ") or "No fandoms available" }
-        )
-        table.insert(kv_pairs, { "     " .. "Date:", v.date })
-        table.insert(
-            kv_pairs,
-            { "     " .. "Warnings:", #v.warnings > 0 and table.concat(v.warnings, ", ") or "No warnings available" }
-        )
-        table.insert(kv_pairs, {
-            "     " .. "Relationships:",
-            "("
-                .. v.category
-                .. ") "
-                .. (#v.relationships > 0 and table.concat(v.relationships, ", ") or "No relationships available"),
-        })
-        table.insert(kv_pairs, {
-            "     " .. "Characters:",
-            #v.characters > 0 and table.concat(v.characters, ", ") or "No characters available",
-        })
-        table.insert(
-            kv_pairs,
-            { "     " .. "Other Tags:", #v.tags > 0 and table.concat(v.tags, ", ") or "No tags available" }
-        )
-        table.insert(kv_pairs, { "     " .. "Summary:", v.summary })
-        table.insert(kv_pairs, { "     " .. "Language:", v.language })
-        table.insert(kv_pairs, { "     " .. "Words:", v.words })
-        table.insert(kv_pairs, { "     " .. v.iswip .. ", Chapters:", v.chapters })
+        end
 
-        -- Combine comments, kudos, bookmarks, and hits into one line
-        local stats = string.format(
-            "Hits: %s | Kudos: %s | Bookmarks: %s | Comments: %s",
-            v.hits or "0",
-            v.kudos or "0",
-            v.bookmarks or "0",
-            v.comments or "0"
-        )
-        table.insert(kv_pairs, { "     " .. "Stats:", stats, separator = true })
-        ::continue::
+        -- == SEPARATOR ==
+        addSpacing(Size.padding.small)
+        addElement(LineWidget:new{
+            dimen = Geom:new{ w = content_width, h = Size.line.medium },
+            background = Blitbuffer.COLOR_DARK_GRAY,
+        })
+        addSpacing(Size.padding.small)
+
+        -- == TAG SECTIONS ==
+        -- Measure one line height for truncation constraints.
+        local tag_line_height = TextBoxWidget:new{
+            text = "X",
+            face = stats_face,
+            width = content_width,
+        }:getSize().h
+
+        -- Fandom
+        local fandom_text = "Fandom: " .. (#fanfic.fandoms > 0 and table.concat(fanfic.fandoms, ", ") or "None listed")
+        addElement(TextBoxWidget:new{
+            text = truncateToFit(fandom_text, stats_face, tag_line_height),
+            face = stats_face,
+            width = content_width,
+            height = tag_line_height,
+        })
+
+        -- Warnings
+        local warnings_text = "Warnings: " .. (#fanfic.warnings > 0 and table.concat(fanfic.warnings, ", ") or "None")
+        addElement(TextBoxWidget:new{
+            text = truncateToFit(warnings_text, stats_face, tag_line_height),
+            face = stats_face,
+            width = content_width,
+            height = tag_line_height,
+        })
+
+        -- Relationships - single line, ellipsis if too long
+        local rel_text = "Relationships: "
+        if fanfic.category and fanfic.category ~= "" then
+            rel_text = rel_text .. "(" .. fanfic.category .. ") "
+        end
+        rel_text = rel_text .. (#fanfic.relationships > 0 and table.concat(fanfic.relationships, ", ") or "None listed")
+        addElement(TextBoxWidget:new{
+            text = truncateToFit(rel_text, stats_face, tag_line_height),
+            face = stats_face,
+            width = content_width,
+            height = tag_line_height,
+        })
+
+        -- Characters - single line, ellipsis if too long
+        local char_text = "Characters: " .. (#fanfic.characters > 0 and table.concat(fanfic.characters, ", ") or "None listed")
+        addElement(TextBoxWidget:new{
+            text = truncateToFit(char_text, stats_face, tag_line_height),
+            face = stats_face,
+            width = content_width,
+            height = tag_line_height,
+        })
+
+        -- Tags - single line, ellipsis if too long
+        local tags_text = "Tags: " .. (#fanfic.tags > 0 and table.concat(fanfic.tags, ", ") or "None")
+        addElement(TextBoxWidget:new{
+            text = truncateToFit(tags_text, stats_face, tag_line_height),
+            face = stats_face,
+            width = content_width,
+            height = tag_line_height,
+        })
+
+        -- == SEPARATOR before summary ==
+        addSpacing(Size.padding.small)
+        addElement(LineWidget:new{
+            dimen = Geom:new{ w = content_width, h = Size.line.medium },
+            background = Blitbuffer.COLOR_DARK_GRAY,
+        })
+        addSpacing(Size.padding.small)
     end
 
-    return kv_pairs
+    -- == SUMMARY ==
+    -- Gets all remaining vertical space after the elements above.
+    local available_for_summary = self.content_height - used_height
+    if available_for_summary < Screen:scaleBySize(60) then
+        available_for_summary = Screen:scaleBySize(60)
+    end
+
+    local raw_summary = fanfic.summary or "No summary available"
+
+    raw_summary = truncateToFit(raw_summary, body_face, available_for_summary)
+
+    addElement(TextBoxWidget:new{
+        text = raw_summary,
+        face = body_face,
+        width = content_width,
+        height = available_for_summary,
+    })
+
+    local card_content = VerticalGroup:new{ align = "left" }
+    for _, elem in ipairs(elements) do
+        table.insert(card_content, elem)
+    end
+
+    return card_content
 end
 
 function FanficBrowser:showDownloadDialog(fanfic)
@@ -246,10 +423,9 @@ function FanficBrowser:showDownloadDialog(fanfic)
                     callback = function()
                         UIManager:scheduleIn(1, function()
                             self.downloadFanficCallback(fanfic.id)
-                            self.browse_window:reload()
                         end)
                         UIManager:show(InfoMessage:new({
-                            text = _("Downloading work may take some time…"),
+                            text = _("Downloading work may take some time."),
                             timeout = 1,
                         }))
                         UIManager:close(confirmDialog)
@@ -293,107 +469,22 @@ function FanficBrowser:show(ui, ficResults, fetchNextPage, updateFanficCallback,
     self.showAuthorInfoCallback = showAuthorInfoCallback
     self.Fanfic = Fanfic
 
-    local kv_pairs = self:generateTable({}, ficResults, updateFanficCallback, downloadFanficCallback)
-    local total_fic_count = ficResults.total
+    -- Remove the total field so it does not get treated as a fanfic entry.
     ficResults.total = nil
-    self.fanfics_loaded = ficResults
 
-    local BrowseWindow = KeyValuePage:extend({
-    })
-    -- Override _populateItems to check if it's the last page and load more results
-    local originalPopulateItems = KeyValuePage._populateItems
-    BrowseWindow._populateItems = function(selfself)
-        if selfself.show_page == selfself.pages then
-            -- Fetch more results if on the last page
-            local newFics = fetchNextPage()
-            if newFics and #newFics > 0 then
-                selfself:addNewFanfics(newFics)
-            end
-        end
+    local browse_window = FanficCardPage:new{
+        title = _("AO3 Search Results"),
+        fanfics = ficResults,
+        fetchNextPage = fetchNextPage,
+        close_callback = function()
+            Fanfic.menu_stack[self.browse_window] = nil
+            self.browse_window = nil
+        end,
+    }
 
-        -- Call the original _populateItems function
-        KeyValuePage._populateItems(selfself)
-    end
-
-    BrowseWindow.addNewFanfics = function(selfself, newFics)
-        selfself.kv_pairs = self:generateTable(selfself.kv_pairs, newFics, updateFanficCallback, downloadFanficCallback)
-
-        newFics.total = nil
-        -- Add new works to loaded fanfics table
-        for k, v in pairs(newFics) do
-            table.insert(self.fanfics_loaded, v)
-        end
-
-        -- Update the total number of pages
-        selfself.pages = math.ceil(#selfself.kv_pairs / selfself.items_per_page)
-        self.browse_window = BrowseWindow:new({
-            title = selfself.title,
-            title_bar_fm_style = true,
-            is_popout = false,
-            is_borderless = true,
-            kv_pairs = selfself.kv_pairs,
-            show_page = selfself.show_page,
-            value_overflow_align = "center",
-        })
-        self.browse_window:setMaximumPageValueCount(self.items_per_fic)
-        UIManager:show(self.browse_window)
-        UIManager:close(selfself)
-    end
-
-    BrowseWindow.reload = function(selfself)
-        selfself.kv_pairs = self:generateTable({}, self.fanfics_loaded, updateFanficCallback, downloadFanficCallback)
-
-        -- Update the total number of pages
-        selfself.pages = math.ceil(#selfself.kv_pairs / selfself.items_per_page)
-        if (self.browse_window) then
-            self.Fanfic.menu_stack[self.browse_window] = nil
-        end
-        self.browse_window = BrowseWindow:new({
-            title = selfself.title,
-            title_bar_fm_style = true,
-            is_popout = false,
-            is_borderless = true,
-            kv_pairs = selfself.kv_pairs,
-            show_page = selfself.show_page,
-            value_overflow_align = "center",
-        })
-        self.Fanfic.menu_stack[self.browse_window] = true
-        self.browse_window:setMaximumPageValueCount(self.items_per_fic)
-        UIManager:show(self.browse_window)
-        UIManager:close(selfself)
-    end
-
-
-    BrowseWindow.setMaximumPageValueCount = function(selfself, amount)
-        if selfself.items_per_page > amount then
-            selfself.items_per_page = amount
-            selfself.pages = math.ceil(#selfself.kv_pairs / selfself.items_per_page)
-        end
-        selfself:_populateItems()
-    end
-
-    BrowseWindow.onClose = function(selfself)
-        self.Fanfic.menu_stack[selfself] = nil
-        return KeyValuePage.onClose(selfself)
-    end
-
-    self.items_per_fic = 14
-    -- Create the KeyValuePage
-    self.browse_window = BrowseWindow:new({
-        title = T("(%1) Tap fanfic title to download", total_fic_count or "ERROR"),
-        title_bar_fm_style = true,
-        is_popout = false,
-        is_borderless = true,
-        kv_pairs = kv_pairs,
-        value_overflow_align = "center",
-        show_page = 1,
-    })
-
-    self.Fanfic.menu_stack[self.browse_window] = true
-
-    self.browse_window:setMaximumPageValueCount(self.items_per_fic)
-
-    UIManager:show(self.browse_window)
+    self.browse_window = browse_window
+    Fanfic.menu_stack[browse_window] = true
+    UIManager:show(browse_window)
 end
 
 return FanficBrowser
