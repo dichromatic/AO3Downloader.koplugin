@@ -25,7 +25,6 @@ local Blitbuffer = require("ffi/blitbuffer")
 
 local FanficBrowser = {
     ui = nil,
-    browse_window = nil,
     updateFanficCallback = nil,
     downloadFanficCallback = nil,
     showAuthorInfoCallback = nil,
@@ -698,13 +697,14 @@ function FanficBrowser:show(ui, ficResults, fetchNextPage, updateFanficCallback,
         showAuthorInfoCallback = showAuthorInfoCallback,
         searchByTagCallback = searchByTagCallback,
         Fanfic = Fanfic,
-        close_callback = function()
-            Fanfic.menu_stack[self.browse_window] = nil
-            self.browse_window = nil
-        end,
     }
 
-    self.browse_window = browse_window
+    -- Assigned after construction so the closure captures the populated
+    -- local rather than a nil upvalue from inside the constructor table.
+    browse_window.close_callback = function()
+        Fanfic.menu_stack[browse_window] = nil
+    end
+
     Fanfic.menu_stack[browse_window] = true
     UIManager:show(browse_window)
 end
